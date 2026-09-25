@@ -13,13 +13,39 @@ import Quickshell.Services.Pipewire
 // The stream node only exists while audio is actually flowing, so this
 // reports unavailable when playback is stopped — the slider hides rather
 // than pretending to control something.
+//
+// The tracker below binds every playback stream up front instead of binding
+// just the selected node. The tracker's input may not depend on anything the
+// tracker itself populates: `properties` is only filled in once a node is
+// bound, so a binding shaped like `node: findNode(); objects: [node]` reads
+// its own output and quickshell reports it as a binding loop. That loop made
+// the tracker list oscillate, which drove repeated proxy unbind/rebind cycles
+// in quickshell's PipeWire service and could crash it
+// (quickshell-mirror/quickshell#529). Filtering by `isStream`/`isSink`/`audio`
+// is safe: those are populated when the node is discovered, before any
+// binding, exactly like the shell's own audio panel and media service do it.
 Item {
   id: root
 
   // MPRIS identity of the selected player, e.g. "Chromium".
   property string appHint: ""
 
-  readonly property var node: findNode()
+  readonly property var nodes: Pipewire.ready ? Pipewire.nodes.values : []
+
+  // Every playback stream currently visible to PipeWire. This list only
+  // reads unbound node attributes, so it never depends on the tracker below.
+  readonly property var playbackStreams: {
+    var list = []
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i]
+      // isStream + isSink = Stream/Output/Audio: what a player emits, not
+      // what a microphone captures. `audio` excludes video-only streams.
+      if (n && n.isStream && n.isSink && n.audio) list.push(n)
+    }
+    return list
+  }
+
+  readonly property var node: selectNode()
   readonly property bool available: node !== null && node.audio !== null
   readonly property real volume: available ? node.audio.volume : 0
 
@@ -47,17 +73,17 @@ Item {
     return 0
   }
 
-  function findNode() {
+  // Runs against already-bound streams, so reading `properties` here is
+  // valid. Re-evaluating never changes the tracker's input list.
+  function selectNode() {
     var hint = String(root.appHint).trim().toLowerCase()
-    if (!Pipewire.ready || hint === "") return null
+    if (hint === "") return null
 
-    var nodes = Pipewire.nodes.values
     var best = null
     var bestScore = 0
 
-    for (var i = 0; i < nodes.length; i++) {
-      var candidate = nodes[i]
-      if (!candidate || !candidate.isStream) continue
+    for (var i = 0; i < root.playbackStreams.length; i++) {
+      var candidate = root.playbackStreams[i]
       var score = scoreNode(candidate, hint)
       if (score > bestScore) {
         best = candidate
@@ -68,7 +94,10 @@ Item {
   }
 
   // Node properties stay stale unless the object is explicitly tracked.
+  // Tracking the whole stream list keeps every candidate's `properties`
+  // fresh and lets `selectNode` re-score reactively; setting a stable list
+  // re-refs before unref'ing, so no proxy is torn down on re-evaluation.
   PwObjectTracker {
-    objects: root.node ? [root.node] : []
+    objects: root.playbackStreams
   }
 }
