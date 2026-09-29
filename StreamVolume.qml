@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Services.Pipewire
+import "StreamModel.js" as StreamModel
 
 // Volume for players that do not implement the MPRIS volume property.
 //
@@ -19,7 +20,13 @@ Item {
   // MPRIS identity of the selected player, e.g. "Chromium".
   property string appHint: ""
 
-  readonly property var node: findNode()
+  // Not a declarative binding to a fresh scan -- see refreshNode(). A naive
+  // `readonly property var node: findNode()` re-scanned (and reassigned)
+  // on every PipeWire event of any kind, which produced a QML binding loop
+  // and, downstream, a crash: see StreamModel.selectStreamNode for the full
+  // explanation and the crash this fixes.
+  property var node: null
+
   readonly property bool available: node !== null && node.audio !== null
   readonly property real volume: available ? node.audio.volume : 0
 
@@ -27,45 +34,28 @@ Item {
     if (root.available) root.node.audio.volume = Math.max(0, Math.min(1, value))
   }
 
-  function overlaps(field, hint) {
-    var value = String(field || "").trim().toLowerCase()
-    if (value === "") return false
-    // Either direction: PipeWire may report "chromium" where MPRIS says
-    // "Chromium", or a binary "youtube-music" against the identity
-    // "com.github.th-ch.youtube-music".
-    return value.indexOf(hint) !== -1 || hint.indexOf(value) !== -1
+  // Re-selects the stream node, keeping the current one if it is still a
+  // live match rather than always taking the freshly-rescanned best match --
+  // see StreamModel.selectStreamNode.
+  function refreshNode() {
+    var nodes = Pipewire.ready ? Pipewire.nodes.values : []
+    var selected = StreamModel.selectStreamNode(nodes, root.appHint, root.node)
+    if (selected !== root.node) root.node = selected
   }
 
-  // The process binary outranks the application name because Electron clients
-  // report themselves as "Chromium" too — with a browser also running, the
-  // name alone would happily pick the wrong stream.
-  function scoreNode(candidate, hint) {
-    var props = candidate.properties || {}
-    if (overlaps(props["application.process.binary"], hint)) return 3
-    if (overlaps(props["application.name"], hint)) return 2
-    if (overlaps(candidate.name, hint)) return 1
-    return 0
+  onAppHintChanged: refreshNode()
+
+  Connections {
+    target: Pipewire.nodes
+    function onValuesChanged() { root.refreshNode() }
   }
 
-  function findNode() {
-    var hint = String(root.appHint).trim().toLowerCase()
-    if (!Pipewire.ready || hint === "") return null
-
-    var nodes = Pipewire.nodes.values
-    var best = null
-    var bestScore = 0
-
-    for (var i = 0; i < nodes.length; i++) {
-      var candidate = nodes[i]
-      if (!candidate || !candidate.isStream) continue
-      var score = scoreNode(candidate, hint)
-      if (score > bestScore) {
-        best = candidate
-        bestScore = score
-      }
-    }
-    return best
+  Connections {
+    target: Pipewire
+    function onReadyChanged() { root.refreshNode() }
   }
+
+  Component.onCompleted: refreshNode()
 
   // Node properties stay stale unless the object is explicitly tracked.
   PwObjectTracker {
